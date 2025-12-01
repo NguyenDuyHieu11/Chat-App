@@ -56,6 +56,10 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = 'themoon.urls'
 
+# Redirect to login page when @login_required is triggered
+LOGIN_URL = '/login/'
+LOGIN_REDIRECT_URL = '/chat/room/1/'  # Default chat room after login
+
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
@@ -80,8 +84,12 @@ ASGI_APPLICATION = 'themoon.asgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'themoon_db',
+        'USER': 'themoon_user',
+        'PASSWORD': 'themoon_pass123',
+        'HOST': 'localhost',
+        'PORT': '5432',
     }
 }
 
@@ -136,6 +144,7 @@ CHANNEL_LAYERS = {
     },
 }
 
+# to reference this cache, just import from django.core.cache, channel's cache works internally.
 CACHES = {
     "default": {
         "BACKEND": "django_redis.cache.RedisCache",

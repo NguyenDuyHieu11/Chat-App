@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class CacheKeyBuilder:
     """
-    Centralized key generation with namespace support.
+    Centralized key generation with domain support.
     
     Provides consistent key formatting across the application:
     - Prevents key collisions
@@ -32,33 +32,26 @@ class CacheKeyBuilder:
     VERSION = "v1"
     
     @classmethod
-    def build(cls, namespace: str, *parts: Union[str, int], version: Optional[str] = None) -> str:
+    def build(cls, domain: str, *parts: Union[str, int]) -> str:
         """
-        Build a cache key with namespace and optional version.
-        
-        Args:
-            namespace: Domain namespace (e.g., 'chat', 'feed', 'user')
-            parts: Key components (e.g., 'conversation', conv_id, 'messages')
-            version: Optional version override
-            
+        Build a cache key with domain and parts (for now it is just chat_id)
+
+        Args: 
+            domain: Domain name (for now it is just chat)
+            parts: Key components (for now it is just chat_id)
+
         Returns:
-            Formatted cache key (e.g., 'chat:v1:conversation:123:messages')
-            
-        Example:
-            >>> CacheKeyBuilder.build('chat', 'conversation', 123, 'messages')
-            'chat:v1:conversation:123:messages'
+            Formatted cache key (for now it is just chat_id)
         """
-        version = version or cls.VERSION
-        key_parts = [namespace, version] + [str(part) for part in parts]
-        return cls.SEPARATOR.join(key_parts)
+        return cls.SEPARATOR.join([domain, *parts])
     
     @classmethod
-    def pattern(cls, namespace: str, *parts: Union[str, int]) -> str:
+    def pattern(cls, domain: str, *parts: Union[str, int]) -> str:
         """
         Build a key pattern for bulk operations (e.g., delete_pattern).
         
         Args:
-            namespace: Domain namespace
+            domain: Domain domain
             parts: Key components, use '*' for wildcards
             
         Returns:
@@ -68,7 +61,7 @@ class CacheKeyBuilder:
             >>> CacheKeyBuilder.pattern('chat', 'conversation', '*', 'messages')
             'chat:v1:conversation:*:messages'
         """
-        return cls.build(namespace, *parts)
+        return cls.build(domain, *parts)
 
 
 class CacheSerializer:
@@ -108,12 +101,12 @@ class BaseCacheStrategy(ABC):
     (write-through, cache-aside, write-behind) for different domains.
     
     Subclasses must implement:
-    - namespace: Domain-specific namespace
+    - domain: Domain-specific domain
     - default_ttl: Default time-to-live for cached items
     - _fetch_from_source: How to retrieve data from the primary source (DB)
     """
     
-    namespace: str = ""  # Must be overridden (e.g., 'chat', 'feed')
+    domain: str = ""  # Must be overridden (e.g., 'chat', 'feed')
     default_ttl: int = 3600  # 1 hour default
     
     def __init__(self, serialize: bool = True):
@@ -124,12 +117,12 @@ class BaseCacheStrategy(ABC):
             serialize: Whether to JSON-serialize data (True for complex objects)
         """
         self.serialize = serialize
-        if not self.namespace:
-            raise ValueError(f"{self.__class__.__name__} must define a 'namespace' attribute")
+        if not self.domain:
+            raise ValueError(f"{self.__class__.__name__} must define a 'domain' attribute")
     
     def _build_key(self, *parts: Union[str, int]) -> str:
-        """Build a namespaced cache key."""
-        return CacheKeyBuilder.build(self.namespace, *parts)
+        """Build a domaind cache key."""
+        return CacheKeyBuilder.build(self.domain, *parts)
     
     def _serialize(self, data: Any) -> Any:
         """Conditionally serialize data."""
@@ -342,6 +335,10 @@ class WriteThroughCacheStrategy(BaseCacheStrategy):
     - Cache is always consistent with DB
     - Higher write latency
     - Read performance is excellent
+    
+    Note: Subclasses can override storage mechanisms for specialized use cases.
+    For example, using Redis LISTs for append-only data structures (see
+    ConversationMessagesCache for LIST-based implementation).
     """
     
     def write(self, *key_parts: Union[str, int], value: Any, persist_func: callable) -> bool:
@@ -417,29 +414,29 @@ class CacheManager:
         return cls._instance
     
     @staticmethod
-    def clear_namespace(namespace: str) -> bool:
+    def clear_domain(domain: str) -> bool:
         """
-        Clear all keys in a namespace.
+        Clear all keys in a domain.
         
         Warning: Use with caution in production.
         
         Args:
-            namespace: Namespace to clear (e.g., 'chat', 'feed')
+            domain: domain to clear (e.g., 'chat', 'feed')
             
         Returns:
             True if successful
         """
         try:
             # Note: Django's cache.delete_pattern requires django-redis backend
-            pattern = CacheKeyBuilder.pattern(namespace, '*')
+            pattern = CacheKeyBuilder.pattern(domain, '*')
             cache.delete_pattern(pattern)
-            logger.info(f"Cleared cache namespace: {namespace}")
+            logger.info(f"Cleared cache domain: {domain}")
             return True
         except AttributeError:
             logger.warning("delete_pattern not supported by current cache backend")
             return False
         except Exception as e:
-            logger.error(f"Error clearing namespace {namespace}: {e}")
+            logger.error(f"Error clearing domain {domain}: {e}")
             return False
     
     @staticmethod

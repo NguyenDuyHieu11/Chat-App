@@ -1,9 +1,10 @@
 from django.db import models
+from django.contrib.auth.models import User
 
 # Create your models here.
 
 class AppUser(models.Model):
-    id = models.AutoField(primary_key=True)
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='app_user')
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
     profile_name = models.CharField(max_length=100, unique=True)
