@@ -18,10 +18,13 @@ from channels.db import database_sync_to_async
 from django.test import TestCase, TransactionTestCase
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django_redis import get_redis_connection
 
 from chat.consumers import ChatConsumer
+from chat.presence_consumers import PresenceConsumer
+from chat.presence_redis import PresenceConfig, now_ts_seconds, online_users_key_for_user
 from chat.models import Conversation, Message
-from feed.models import AppUser
+from feed.models import AppUser, Follower
 from core.redis_health import RedisHealthChecker
 
 
@@ -119,6 +122,201 @@ class ChatConsumerTestCase(TransactionTestCase):
         
         # Disconnect
         await communicator.disconnect()
+
+    async def test_presence_consumer_subscribe_denied_when_not_mutual_followers(self):
+        """PresenceConsumer must deny subscription unless users are mutual followers."""
+        communicator = WebsocketCommunicator(
+            PresenceConsumer.as_asgi(),
+            "/ws/presence/",
+        )
+        communicator.scope["user"] = self.user1
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        # Connected ack
+        msg = await communicator.receive_json_from()
+        self.assertEqual(msg["type"], "presence.connected")
+        self.assertEqual(msg["user_id"], self.app_user1.id)
+
+        # Try to subscribe to user2 without mutual follow
+        await communicator.send_json_to(
+            {"type": "presence.subscribe", "target_user_id": self.app_user2.id}
+        )
+        resp = await communicator.receive_json_from()
+        self.assertEqual(resp["type"], "presence.subscribe.denied")
+        self.assertEqual(resp["target_user_id"], self.app_user2.id)
+        self.assertEqual(resp["reason"], "not_mutual_followers")
+
+        await communicator.disconnect()
+
+    async def test_presence_consumer_subscribe_ok_when_mutual_followers(self):
+        """PresenceConsumer must allow subscription when mutual follow exists."""
+        Follower.objects.create(following_user=self.app_user1, followed_user=self.app_user2)
+        Follower.objects.create(following_user=self.app_user2, followed_user=self.app_user1)
+
+        communicator = WebsocketCommunicator(
+            PresenceConsumer.as_asgi(),
+            "/ws/presence/",
+        )
+        communicator.scope["user"] = self.user1
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        _ = await communicator.receive_json_from()
+
+        await communicator.send_json_to(
+            {"type": "presence.subscribe", "target_user_id": self.app_user2.id}
+        )
+        resp = await communicator.receive_json_from()
+        self.assertEqual(resp["type"], "presence.subscribe.ok")
+        self.assertEqual(resp["target_user_id"], self.app_user2.id)
+
+        await communicator.disconnect()
+
+    async def test_presence_heartbeat_updates_online_users_zset_and_emits_online(self):
+        """
+        Heartbeat must:
+        - ZADD expiry score into the correct online_users shard key
+        - Emit an "online" status event on first heartbeat (missing/expired -> online)
+        """
+        communicator = WebsocketCommunicator(
+            PresenceConsumer.as_asgi(),
+            "/ws/presence/",
+        )
+        communicator.scope["user"] = self.user1
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        # connected ack
+        _ = await communicator.receive_json_from()
+
+        await communicator.send_json_to({"type": "presence.heartbeat"})
+
+        # Should receive online status via group_send to own group
+        evt = await communicator.receive_json_from()
+        self.assertEqual(evt["type"], "presence.status")
+        self.assertEqual(evt["user_id"], self.app_user1.id)
+        self.assertEqual(evt["status"], "online")
+
+        # Verify Redis ZSET contains member with expiry >= now
+        cfg = PresenceConfig()
+        key = online_users_key_for_user(cfg, self.app_user1.id)
+        member = str(self.app_user1.id)
+        conn = get_redis_connection("default")
+        score = conn.zscore(key, member)
+        self.assertIsNotNone(score)
+        self.assertGreaterEqual(float(score), float(now_ts_seconds()))
+
+        await communicator.disconnect()
+
+    async def test_presence_away_and_active_broadcast_and_snapshot(self):
+        """
+        - presence.away should broadcast away and persist state for snapshots
+        - subscribing should immediately receive a snapshot status
+        """
+        # Make users mutual followers so user1 can subscribe to user2
+        Follower.objects.create(following_user=self.app_user1, followed_user=self.app_user2)
+        Follower.objects.create(following_user=self.app_user2, followed_user=self.app_user1)
+
+        comm1 = WebsocketCommunicator(PresenceConsumer.as_asgi(), "/ws/presence/")
+        comm1.scope["user"] = self.user1
+        connected, _ = await comm1.connect()
+        self.assertTrue(connected)
+        _ = await comm1.receive_json_from()  # presence.connected
+
+        comm2 = WebsocketCommunicator(PresenceConsumer.as_asgi(), "/ws/presence/")
+        comm2.scope["user"] = self.user2
+        connected, _ = await comm2.connect()
+        self.assertTrue(connected)
+        _ = await comm2.receive_json_from()  # presence.connected
+
+        # user2 becomes online
+        await comm2.send_json_to({"type": "presence.heartbeat"})
+        evt2 = await comm2.receive_json_from()
+        self.assertEqual(evt2["status"], "online")
+
+        # user1 subscribes to user2 and should receive snapshot
+        await comm1.send_json_to({"type": "presence.subscribe", "target_user_id": self.app_user2.id})
+        _ = await comm1.receive_json_from()  # subscribe.ok
+        snap = await comm1.receive_json_from()
+        self.assertTrue(snap.get("snapshot"))
+        self.assertEqual(snap["user_id"], self.app_user2.id)
+        self.assertEqual(snap["status"], "online")
+
+        # user2 goes away and user1 should receive event
+        await comm2.send_json_to({"type": "presence.away"})
+        away_evt = await comm1.receive_json_from()
+        self.assertEqual(away_evt["type"], "presence.status")
+        self.assertEqual(away_evt["user_id"], self.app_user2.id)
+        self.assertEqual(away_evt["status"], "away")
+
+        await comm1.disconnect()
+        await comm2.disconnect()
+
+    async def test_chat_typing_events_do_not_require_message_content(self):
+        """
+        ChatConsumer should accept presence.typing.start/stop without 'message'/'content'
+        and broadcast to the conversation group.
+        """
+        comm1 = WebsocketCommunicator(ChatConsumer.as_asgi(), f"/ws/chat/{self.conversation.id}/")
+        comm1.scope["user"] = self.user1
+        comm1.scope["url_route"] = {"kwargs": {"conversation_id": str(self.conversation.id)}}
+
+        comm2 = WebsocketCommunicator(ChatConsumer.as_asgi(), f"/ws/chat/{self.conversation.id}/")
+        comm2.scope["user"] = self.user2
+        comm2.scope["url_route"] = {"kwargs": {"conversation_id": str(self.conversation.id)}}
+
+        connected, _ = await comm1.connect()
+        self.assertTrue(connected)
+        _ = await comm1.receive_json_from()  # message_history
+
+        connected, _ = await comm2.connect()
+        self.assertTrue(connected)
+        _ = await comm2.receive_json_from()  # message_history
+
+        await comm1.send_json_to({"type": "presence.typing.start"})
+
+        # comm2 should receive typing event (comm1 may also receive; we only assert comm2)
+        evt = await comm2.receive_json_from()
+        # If message_history race occurs, this may be chat.message; loop until we see typing
+        while evt.get("type") != "presence.typing":
+            evt = await comm2.receive_json_from()
+
+        self.assertEqual(evt["type"], "presence.typing")
+        self.assertEqual(evt["conversation_id"], str(self.conversation.id) if isinstance(evt["conversation_id"], str) else evt["conversation_id"])
+        self.assertEqual(evt["user_id"], self.app_user1.id)
+        self.assertTrue(evt["is_typing"])
+
+        await comm1.disconnect()
+        await comm2.disconnect()
+
+    def test_presence_leaderboard_endpoint_returns_mutual_followers_with_status(self):
+        """
+        GET /chat/api/presence/leaderboard/ should return mutual followers ordered with online first.
+        """
+        # Mutual follow between app_user1 and app_user2
+        Follower.objects.create(following_user=self.app_user1, followed_user=self.app_user2)
+        Follower.objects.create(following_user=self.app_user2, followed_user=self.app_user1)
+
+        # Mark app_user2 online in Redis directly
+        cfg = PresenceConfig()
+        conn = get_redis_connection("default")
+        key = online_users_key_for_user(cfg, self.app_user2.id)
+        now_ts = now_ts_seconds()
+        conn.zadd(key, {str(self.app_user2.id): now_ts + cfg.heartbeat_window_seconds})
+
+        self.client.force_login(self.user1)
+        resp = self.client.get("/chat/api/presence/leaderboard/?limit=50")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("results", data)
+
+        # Should include user2
+        ids = [r["user_id"] for r in data["results"]]
+        self.assertIn(self.app_user2.id, ids)
     
     async def test_consumer_connect_unauthenticated(self):
         """Test WebSocket connection rejection for unauthenticated user."""

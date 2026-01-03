@@ -136,11 +136,21 @@ class ChatConsumer(AsyncWebsocketConsumer):
         """
         Handle incoming WebSocket messages.
         
-        Expected message format:
+        Supported message formats:
+
+        Chat message:
         {
             "type": "chat.message",
             "message": "Hello world",
             "content": "Hello world"  # alias for message
+        }
+
+        Typing indicators:
+        {
+            "type": "presence.typing.start"
+        }
+        {
+            "type": "presence.typing.stop"
         }
         """
         try:
@@ -160,6 +170,25 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 return
             
             data_type = data.get('type')
+
+            # Handle non-chat payloads early (they don't contain "message"/"content")
+            if data_type in ("presence.typing.start", "presence.typing.stop"):
+                is_typing = data_type == "presence.typing.start"
+                if not self.app_user:
+                    logger.warning("Typing event received before app_user initialized")
+                    return
+                await self.channel_layer.group_send(
+                    self.conversation_group_name,
+                    {
+                        "type": "presence_typing",
+                        "user_id": self.app_user.id,  # AppUser.id
+                        "user_name": self.app_user.profile_name,
+                        "conversation_id": self.conversation_id,
+                        "is_typing": is_typing,
+                    },
+                )
+                return
+
             message_content = data.get('message') or data.get('content')
             
             # Validate message content
@@ -221,6 +250,22 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 'type': 'error',
                 'message': 'An error occurred processing your message'
             }))
+
+    async def presence_typing(self, event):
+        """
+        Handler for presence_typing events from channel layer.
+        Sends typing indicator to WebSocket client.
+        """
+        try:
+            await self.send(text_data=json.dumps({
+                "type": "presence.typing",
+                "user_id": event.get("user_id"),
+                "user_name": event.get("user_name"),
+                "conversation_id": event.get("conversation_id"),
+                "is_typing": event.get("is_typing", False),
+            }))
+        except Exception as e:
+            logger.error(f"Error in presence_typing handler: {e}", exc_info=True)
 
     async def chat_message(self, event):
         """
