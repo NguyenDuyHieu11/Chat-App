@@ -1,33 +1,571 @@
-the single biggest inspiration is: https://systemdesign.one/real-time-presence-platform-system-design/
-
-# Real-Time Presence Platform Architecture
+# Real-Time Chat & Presence Platform Architecture
 
 ## Executive Summary
 
-This document outlines the architecture and design decisions for a production-ready, scalable real-time presence platform built on Django Channels and Redis. The system tracks online/away/offline status for users, broadcasts changes in real-time, and enforces secure access control based on mutual follower relationships.
+This document outlines the architecture and design decisions for a production-ready, scalable real-time communication platform built on Django Channels, Redis, and PostgreSQL. The system consists of two main features:
+
+1. **Real-Time Chat**: WebSocket-based messaging with write-through caching
+2. **Real-Time Presence**: Online/away/offline status tracking with atomic offline detection
 
 **Key metrics:**
 - Target scale: 100k+ concurrent users
+- Message delivery latency: <50ms
 - Status update latency: <100ms
 - Offline detection accuracy: ±30 seconds
-- Security: mutual-follower authorization
+- Security: Participant-based authorization
 
 ---
 
 ## Table of Contents
 
-1. [System Overview](#system-overview)
-2. [Core Architecture Decisions](#core-architecture-decisions)
-3. [Data Model & Redis Structures](#data-model--redis-structures)
-4. [Component Architecture](#component-architecture)
-5. [Critical Design Patterns](#critical-design-patterns)
-6. [Security Model](#security-model)
-7. [Scalability & Performance](#scalability--performance)
-8. [Trade-offs & Alternatives](#trade-offs--alternatives)
+### Part I: Real-Time Chat System
+1. [Chat System Overview](#part-i-real-time-chat-system)
+2. [Chat Architecture Decisions](#chat-architecture-decisions)
+3. [Chat Data Model](#chat-data-model--caching-strategy)
+4. [Chat Component Architecture](#chat-component-architecture)
+5. [Chat Caching Strategy](#write-through-cache-strategy)
+
+### Part II: Real-Time Presence Platform
+6. [Presence System Overview](#part-ii-real-time-presence-platform)
+7. [Presence Architecture Decisions](#presence-core-architecture-decisions)
+8. [Presence Data Model & Redis](#presence-data-model--redis-structures)
+9. [Presence Component Architecture](#presence-component-architecture)
+10. [Presence Security & Scalability](#presence-security-model)
+
+### Shared Infrastructure
+11. [Design Patterns](#critical-design-patterns)
+12. [Configuration Reference](#configuration-reference)
 
 ---
 
-## System Overview
+# PART I: Real-Time Chat System
+
+---
+
+## Chat System Overview
+
+### Problem Statement
+
+Build a real-time chat system where:
+- Users can send and receive messages instantly via WebSocket
+- Message history loads instantly on connection (cached)
+- **Participants-only access**: Only conversation participants can read/send messages
+- Messages persist durably in PostgreSQL
+- System handles high write throughput (thousands of messages/sec)
+- **Graceful degradation**: If Redis fails, system falls back to PostgreSQL
+
+### High-Level Architecture
+
+```
+┌─────────────┐  Send Message   ┌──────────────────┐
+│   Client    │ ──────────────> │  ChatConsumer    │
+│  (Browser)  │                  │   (WebSocket)    │
+└─────────────┘                  └──────────────────┘
+       │                                  │
+       │ Message History                  │ Save Message
+       │ (on connect)                     ▼
+       │                     ┌────────────────────────┐
+       │                     │  Write-Through Cache   │
+       │                     │  (Redis LIST)          │
+       │                     └────────────────────────┘
+       │                                  │
+       │                                  │ Persist
+       │                                  ▼
+       │                     ┌────────────────────────┐
+       │                     │   MessageRepository    │
+       │                     │   (PostgreSQL)         │
+       │                     └────────────────────────┘
+       │                                  │
+       │ Broadcast                        │
+       └────────<─────────────────────<───┘
+              (Django Channels - Redis DB0)
+```
+
+**Transport mechanism:**
+- **Client ↔ Server**: WebSocket (bidirectional, persistent)
+
+**Data flow:**
+1. User sends message → WebSocket
+2. Save to **PostgreSQL** first (source of truth)
+3. Append to **Redis LIST** (write-through cache)
+4. Broadcast to all participants via **Django Channels**
+
+---
+
+## Chat Architecture Decisions
+
+### 1. Why WebSocket (not HTTP polling)?
+
+**Decision:** Use WebSocket for real-time bidirectional communication.
+
+**Rationale:**
+- **Instant delivery**: Server can push messages immediately
+- **Reduced latency**: No polling overhead (~<50ms vs ~1s with polling)
+- **Lower bandwidth**: One persistent connection vs many HTTP requests
+- **Better UX**: True real-time feel, typing indicators possible
+
+**Trade-off accepted:**
+- Requires persistent connection (~2KB memory/user)
+- Mitigated by: efficient async I/O (Django Channels + Daphne)
+
+---
+
+### 2. Why Redis LIST (not JSON blob or cache-aside)?
+
+**Decision:** Use Redis **LIST** with write-through strategy.
+
+**Key design:**
+```
+Key:    chat:123 (conversation_id)
+Type:   LIST
+Items:  JSON-serialized message objects (oldest → newest)
+Limit:  Last 50 messages (sliding window via LTRIM)
+```
+
+**Why LIST over alternatives?**
+
+| Approach | Write Performance | Cache Invalidation | Complexity |
+|----------|-------------------|-------------------|------------|
+| **Redis LIST (write-through)** | O(1) RPUSH + LTRIM | None (append-only) | Low |
+| JSON blob (cache-aside) | O(N) serialize entire array | Every write | High |
+| No cache | N/A | N/A | PostgreSQL becomes bottleneck |
+
+**Write-through flow:**
+
+1. Write to PostgreSQL (source of truth)
+2. Append to Redis LIST (O(1) `RPUSH`)
+3. Trim to last 50 (`LTRIM -50 -1`)
+4. Refresh TTL (`EXPIRE 1800`)
+5. Execute atomically (Redis pipeline)
+
+**Benefits:**
+- Zero cache invalidations (append-only)
+- O(1) write performance
+- Sliding window automatically maintained
+- Cache miss → populate from DB, transparent to client
+
+---
+
+### 3. Why PostgreSQL for Messages (not Redis-only)?
+
+**Decision:** PostgreSQL is source of truth, Redis is performance layer.
+
+**Rationale:**
+
+| Requirement | PostgreSQL Solution | Redis-Only Problem |
+|-------------|---------------------|-------------------|
+| Durability | ACID transactions | Data lost on crash |
+| Full history | Search old messages | Limited memory |
+| Analytics | Complex queries (JOIN, aggregation) | No relational queries |
+| Compliance | Audit logs, backups | Ephemeral |
+
+**Trade-off:**
+- Write latency +5ms (PostgreSQL insert)
+- Acceptable for chat (human perception ~100ms)
+
+**Hybrid approach wins:**
+- Redis: Fast reads (90% of traffic)
+- PostgreSQL: Durable writes + full history
+
+---
+
+### 4. Participant-Based Authorization
+
+**Decision:** Validate user is a conversation participant before allowing access.
+
+**Security model:**
+
+On WebSocket connect:
+1. Query conversation by ID
+2. Check if `app_user.id` in `conversation.participants`
+3. If not participant → close connection (code 4003 Forbidden)
+
+**Why participants (not message-level ACL)?**
+- Simpler: One DB query per connection (not per message)
+- Natural: Conversation is the security boundary
+- Performant: Check happens once at connect, not per message
+
+---
+
+## Chat Data Model & Caching Strategy
+
+### PostgreSQL Schema
+
+**Conversation Model:**
+- `participants` → ManyToMany to `AppUser`
+- `created_datetime` → timestamp
+
+**Message Model:**
+- `conversation` → ForeignKey (cascade delete)
+- `author` → ForeignKey to `AppUser`
+- `content` → TextField (max 5000 chars enforced at app layer)
+- `created_datetime` → timestamp
+- **Index**: `(conversation, -created_datetime)` for fast recent message queries
+
+**Design notes:**
+- `AppUser` (not Django `User`) for consistency with social graph
+- No soft deletes (KISS principle)
+- No read receipts / reactions (can be added later without schema change)
+- Immutable messages (no edit/delete in current design)
+
+---
+
+### Redis Caching Schema
+
+```
+Key:    chat:123
+Type:   LIST
+Items:  [
+          "{\"id\": 1, \"author\": 42, \"author_name\": \"Alice\", \"content\": \"Hi\", \"created_datetime\": \"2026-01-10T...\"}", 
+          "{\"id\": 2, \"author\": 43, \"author_name\": \"Bob\", \"content\": \"Hello\", \"created_datetime\": \"2026-01-10T...\"}",
+          ...
+        ]
+Limit:  Last 50 messages
+TTL:    1800 seconds (30 minutes)
+```
+
+**Operations:**
+
+```bash
+# On connect: Load history (cache hit)
+LRANGE chat:123 0 -1  # Get all items, O(N) where N ≤ 50
+
+# On new message: Append + trim
+RPUSH chat:123 "{...message json...}"
+LTRIM chat:123 -50 -1  # Keep last 50
+EXPIRE chat:123 1800
+
+# Cache miss: Populate from DB
+# (handled automatically by ConversationMessagesCache)
+```
+
+**Why TTL?**
+- Inactive conversations don't consume memory forever
+- 30min = long enough for active chats, short enough to prevent bloat
+- Cache miss is transparent (automatic DB fallback)
+
+---
+
+## Chat Component Architecture
+
+### 1. ChatConsumer (WebSocket Handler)
+
+**File:** `chat/consumers.py`
+
+**Responsibilities:**
+- Accept authenticated WebSocket connections
+- Validate participant access (security boundary)
+- Handle incoming messages (parse, validate, save)
+- Broadcast messages to all participants via Django Channels
+- Handle typing indicators (conversation-scoped)
+
+**Connection lifecycle:**
+
+1. Extract `conversation_id` from WebSocket URL
+2. Authenticate user (Django session)
+3. **Validate participant access** (DB query, security boundary)
+4. Join Django Channels group `chat_{conversation_id}`
+5. Accept WebSocket connection
+6. Send message history (from Redis cache or PostgreSQL)
+
+**Message flow:**
+
+1. Client sends JSON: `{"type": "chat.message", "message": "Hello"}`
+2. Server validates (not empty, ≤5000 chars)
+3. Save to PostgreSQL (source of truth)
+4. Append to Redis LIST (cache update)
+5. Broadcast to Channels group (all participants receive)
+
+**Typing indicators:**
+
+- Client sends: `{"type": "presence.typing.start"}`
+- Server broadcasts to conversation group (no persistence)
+- Ephemeral, conversation-scoped
+
+**Why separate handlers?**
+- `receive()` handles client → server (authentication, validation, persistence)
+- `chat_message()` handles channel layer → clients (fanout, no logic)
+
+---
+
+### 2. ConversationMessagesCache (Write-Through Strategy)
+
+**File:** `chat/conversation_messages_cache.py`
+
+**Role:** High-performance caching layer using Redis LIST.
+
+**Key operations:**
+
+`get_conversation_messages()`:
+1. Try `LRANGE chat:123 0 -1` (cache hit → return)
+2. Cache miss → query PostgreSQL
+3. Populate cache with results
+4. Return messages
+
+`add_message()` (write-through):
+1. **Save to PostgreSQL first** (source of truth, must succeed)
+2. Append to Redis LIST (`RPUSH`)
+3. Trim to last 50 (`LTRIM`)
+4. Refresh TTL (`EXPIRE`)
+5. Pipeline all Redis commands (atomic, single RTT)
+
+**Why pipeline?**
+- **Atomicity**: RPUSH + LTRIM + EXPIRE happen together or not at all
+- **Performance**: One network round-trip vs three
+- **Consistency**: No partial updates if connection drops mid-operation
+
+---
+
+### 3. MessageRepository (Data Access Layer)
+
+**File:** `chat/repository_layer/message_repo.py`
+
+**Role:** Encapsulate all PostgreSQL operations (Repository pattern).
+
+**Key methods:**
+
+- `get_conversation_messages(conversation_id, limit=50)` → Query last N messages, oldest-first
+- `create_message(conversation_id, author_id, content)` → Insert new message
+- `serialize_message(messages)` → Convert ORM to JSON-serializable dicts
+
+**Query optimization:**
+- Index on `(conversation_id, -created_datetime)` for fast recent message lookup
+- ORDER BY `-created_datetime` LIMIT 50 → uses index scan
+- Reversed in Python (cheap for 50 items)
+
+**Why Repository pattern?**
+- **Testability**: Easy to mock for unit tests
+- **Consistency**: All DB queries in one place
+- **Refactorability**: Change ORM without touching consumers
+
+---
+
+### 4. Django Channels (Group Broadcasting)
+
+**Built-in component** (not custom code).
+
+**Role:** Fanout messages to all participants in a conversation.
+
+**Group model:**
+
+- Group per conversation: `chat_{conversation_id}`
+- All participants join group on connect
+- Message sender broadcasts to group via `group_send()`
+- All sockets in group receive (including sender)
+- Handler forwards to browser via WebSocket
+
+**Flow:**
+1. Alice sends message → her socket receives
+2. Socket saves to DB + cache
+3. Socket calls `group_send(group, payload)`
+4. Channels distributes to all group members (Alice + Bob)
+5. Each socket's `chat_message()` handler forwards to browser
+
+**Why Django Channels (not custom pub/sub)?**
+- Production-ready (used by Instagram, Disqus)
+- Handles multi-server fanout automatically (Redis pub/sub under the hood)
+- Integrates with Django auth/middleware
+
+---
+
+## Write-Through Cache Strategy
+
+### Why Write-Through (not Cache-Aside or Write-Behind)?
+
+**Write-Through characteristics:**
+- Every write goes to DB **and** cache simultaneously
+- Cache is always consistent with DB
+- Slower writes, faster reads
+
+**Comparison:**
+
+| Strategy | Write Latency | Consistency | Complexity | Use Case |
+|----------|---------------|-------------|------------|----------|
+| **Write-Through** | High (DB + cache) | Strong | Medium | **Chat** (consistency critical) |
+| Cache-Aside | Low (DB only) | Eventual | Low | Read-heavy, stale OK |
+| Write-Behind | Lowest (cache only) | Weak | High | Extreme write throughput |
+
+**Chat requirements favor write-through:**
+- **Consistency**: Users must see their own message immediately
+- **Durability**: Messages cannot be lost (write to DB first)
+- **Read-heavy**: 90% traffic is reading history on connect
+
+**Performance trade-off:**
+- Write: +5ms (cache update after DB)
+- Read: -50ms (cache hit vs DB query)
+- Net win: Most operations are reads
+
+---
+
+### Cache Invalidation Strategy
+
+**Answer: We don't invalidate. We append.**
+
+Traditional cache-aside:
+1. Write to DB
+2. Invalidate cache key
+3. Next read → cache miss → slow
+
+Write-through with LIST:
+1. Write to DB
+2. **Append to LIST** (no invalidation)
+3. Trim to last 50 (LTRIM)
+4. Next read → cache hit → fast
+
+**Why this works:**
+- Messages are **immutable** (no updates/deletes in chat)
+- **Append-only** data structure (LIST)
+- **Sliding window** via LTRIM (automatic garbage collection)
+- **Zero invalidations** = zero cache misses after write
+
+---
+
+## Chat Security Model
+
+### Participant Authorization
+
+**Security boundary:** Conversation participants.
+
+**Enforcement point:** WebSocket `connect()` method.
+
+**Flow:**
+
+1. Check conversation exists
+2. Get AppUser (bridge from Django User to domain model)
+3. Query: `conversation.participants.filter(id=app_user.id).exists()`
+4. If not participant → close connection (code 4003)
+
+**Why validate at connect (not per message)?**
+- **Performance**: One DB query per connection vs per message
+- **Security**: Once authorized, connection is trusted
+- **Simplicity**: No need to store auth state per message
+
+**Attack vectors prevented:**
+- ❌ Non-participants reading messages (closed connection immediately)
+- ❌ Non-participants sending messages (not in group, can't broadcast)
+- ❌ Message injection (WebSocket requires auth, payload signed by server)
+
+---
+
+### Input Validation
+
+**Validation rules:**
+
+- **Not empty**: Strip whitespace, reject if empty
+- **Max length**: 5000 characters (18x Twitter, prevents abuse)
+- **Content type**: Plain text only (no HTML)
+
+**Why 5000 chars?**
+- Long enough for typical messages
+- Short enough to prevent abuse / malicious payloads
+- PostgreSQL `TextField` has no hard limit, but application-level enforcement protects DB
+
+**XSS prevention:**
+- Server stores raw text (no HTML allowed)
+- Client renders with escaping (`textContent`, not `innerHTML`)
+- Defense in depth: validation at WebSocket layer, escaping at render layer
+
+---
+
+## Chat Performance & Scalability
+
+### Performance Metrics
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| Connect + history (cache hit) | ~20ms | LRANGE 50 items |
+| Connect + history (cache miss) | ~100ms | DB query + cache populate |
+| Send message | ~50ms | DB write + cache append + broadcast |
+| Broadcast fanout (10 participants) | ~10ms | Channel layer pub/sub |
+| Typing indicator | <5ms | No DB/cache, just broadcast |
+
+**Bottleneck analysis:**
+- **PostgreSQL writes**: ~200 msgs/sec/core (ACID overhead)
+- **Redis reads**: ~50k msgs/sec (single-threaded Redis)
+- **Channels fanout**: Limited by network, not CPU
+
+**For 100k concurrent users:**
+- Assume 1% active (1k sending messages)
+- 1k msgs/sec → PostgreSQL can handle (5 cores)
+- Cache hit ratio ~95% → Redis easily handles reads
+
+---
+
+### Horizontal Scaling
+
+**WebSocket tier (ChatConsumer):**
+- Add more Daphne servers behind load balancer
+- Sticky sessions recommended (but not required)
+- Django Channels handles cross-server groups via Redis pub/sub
+
+**Database tier (PostgreSQL):**
+- Vertical scaling first (more memory/CPU)
+- Read replicas for analytics (not needed for real-time)
+- Partitioning by conversation_id (if >10M conversations)
+
+**Cache tier (Redis):**
+- Vertical scaling (single instance to 100GB RAM)
+- Redis Cluster if memory exceeds single instance
+
+**Scaling example (10k concurrent chats):**
+```
+┌───────────┐     ┌───────────┐     ┌───────────┐
+│ Daphne 1  │     │ Daphne 2  │     │ Daphne 3  │  ← WebSocket servers
+└─────┬─────┘     └─────┬─────┘     └─────┬─────┘
+      │                 │                 │
+      └─────────────────┴─────────────────┘
+                        │
+            ┌───────────┴───────────┐
+            │                       │
+      ┌─────▼─────┐           ┌────▼──────┐
+      │  Redis    │           │PostgreSQL │
+      │ (Cache)   │           │  (Store)  │
+      └───────────┘           └───────────┘
+```
+
+---
+
+## Chat Trade-offs & Future Enhancements
+
+### Trade-offs Made
+
+| Decision | Pro | Con | Mitigation |
+|----------|-----|-----|------------|
+| Write-through (not write-behind) | Strong consistency | +5ms write latency | Acceptable for human perception |
+| LIST (not sorted set) | O(1) append | No random access | Only need recent 50 messages |
+| 50 message cache | Low memory | Older messages slow | Acceptable (scroll to load pattern) |
+| No message editing | Simple | Users can't fix typos | Future: add edit_history field |
+
+---
+
+### Future Enhancements
+
+**1. Read Receipts**
+- Add `MessageRead` model (user, message, read_at)
+- Broadcast read status via WebSocket
+- Challenge: N*M storage (N users × M messages)
+
+**2. Message Reactions**
+- Add `Reaction` model (user, message, emoji)
+- Broadcast via WebSocket
+- Store in Redis for fast access
+
+**3. File Attachments**
+- Store URL in message content (JSON)
+- Upload to S3/CDN, store reference
+- Validate file types and size
+
+**4. Search (Full-Text)**
+- PostgreSQL: `CREATE INDEX USING GIN(to_tsvector('english', content))`
+- ElasticSearch for advanced search (fuzzy, ranking)
+
+---
+
+# PART II: Real-Time Presence Platform
+
+---
+
+## Presence System Overview
 
 ### Problem Statement
 
@@ -70,7 +608,7 @@ Build a real-time presence system where:
 
 ---
 
-## Core Architecture Decisions
+## Presence Core Architecture Decisions
 
 ### 1. Why WebSocket (not UDP) for Heartbeats?
 
@@ -249,7 +787,7 @@ Friends see: offline (1s) → online (brief flap). This is **intentional**—we 
 
 ---
 
-## Data Model & Redis Structures
+## Presence Data Model & Redis Structures
 
 ### Redis Database Allocation
 
@@ -343,7 +881,7 @@ is_mutual = a_follows_b and b_follows_a
 
 ---
 
-## Component Architecture
+## Presence Component Architecture
 
 ### 1. PresenceConsumer (WebSocket Handler)
 
@@ -634,7 +1172,7 @@ class Command(BaseCommand):
 
 ---
 
-## Security Model
+## Presence Security Model
 
 ### Principle: Mutual Follower Authorization
 
@@ -730,7 +1268,7 @@ if len(self.subscribed_groups) >= cfg.max_subscriptions:
 
 ---
 
-## Scalability & Performance
+## Presence Scalability & Performance
 
 ### Horizontal Scaling Strategy
 
@@ -842,7 +1380,7 @@ Loops through all shard keys in one process. Simpler ops, but single bottleneck.
 
 ---
 
-## Trade-offs & Alternatives
+## Presence Trade-offs & Alternatives
 
 ### 1. Polling (Reaper) vs Event-Driven (Keyspace Notifications)
 
@@ -1078,7 +1616,129 @@ curl -H "Cookie: sessionid=..." \
 
 ---
 
-**Document Version:** 1.0  
+---
+
+# System Integration & Deployment
+
+## How Chat and Presence Work Together
+
+Both features share infrastructure but remain independent:
+
+| Component | Chat Usage | Presence Usage | Shared? |
+|-----------|------------|----------------|---------|
+| **WebSocket Endpoints** | `ws/chat/<id>/` | `ws/presence/` | ❌ Separate |
+| **Django Channels (Redis DB0)** | Message broadcasting | Status broadcasting | ✅ Shared |
+| **Redis DB1 (Cache)** | Message history | Presence state | ✅ Shared |
+| **PostgreSQL** | Messages, Conversations | Follower graph | ✅ Shared |
+
+**Key integration point: Typing indicators**
+- Sent via chat WebSocket (`presence.typing.start`)
+- Conversation-scoped (not global)
+- Uses chat consumer, not presence consumer
+
+---
+
+## Running the Full System
+
+### Terminal 1: Django/Daphne (WebSocket Server)
+
+```bash
+cd themoon
+source ../venv/bin/activate
+python manage.py runserver
+# Or for production: daphne -b 0.0.0.0 -p 8000 themoon.asgi:application
+```
+
+### Terminal 2: Presence Reaper (Offline Detection)
+
+```bash
+cd themoon
+source ../venv/bin/activate
+python manage.py run_reaper --poll-interval 1.0
+```
+
+### Production Deployment (systemd)
+
+```ini
+# /etc/systemd/system/themoon-web.service
+[Service]
+ExecStart=/home/app/venv/bin/daphne -b 0.0.0.0 -p 8000 themoon.asgi:application
+WorkingDirectory=/home/app/themoon
+Restart=always
+
+# /etc/systemd/system/themoon-reaper.service
+[Service]
+ExecStart=/home/app/venv/bin/python manage.py run_reaper
+WorkingDirectory=/home/app/themoon
+Restart=always
+```
+
+---
+
+## Monitoring & Observability
+
+### Key Metrics to Track
+
+**Chat:**
+- Message send latency (p50, p99)
+- Cache hit ratio (target: >90%)
+- WebSocket connections per server
+- Messages per second
+
+**Presence:**
+- Heartbeat frequency
+- Reaper batch size (expired users found)
+- Status broadcast latency
+- Online user count
+
+### Redis Monitoring
+
+```bash
+# Check cache size
+redis-cli -n 1 INFO memory
+
+# Check online users count
+redis-cli -n 1 ZCARD online_users
+
+# Check active conversations (cached)
+redis-cli -n 1 KEYS chat:* | wc -l
+```
+
+---
+
+## Architectural Principles Summary
+
+This platform follows these core principles:
+
+1. **Separation of Concerns**
+   - Chat: WebSocket messaging + write-through cache
+   - Presence: ZSET liveness + semantic status
+   - Shared: Django Channels pub/sub fabric
+
+2. **Defense in Depth**
+   - Auth at WebSocket layer (participant validation)
+   - Auth at subscribe layer (mutual follower check)
+   - Input validation at message layer
+
+3. **Graceful Degradation**
+   - Redis fails → PostgreSQL fallback (chat)
+   - Redis fails → all users show offline (presence)
+   - Reaper crashes → users stay online until restart
+
+4. **Performance Through Caching**
+   - Write-through (chat): Strong consistency
+   - ZSET + HASH (presence): Fast expiry queries
+   - Redis LIST (chat): Zero invalidations
+
+5. **Operational Simplicity**
+   - Django management commands (not complex orchestration)
+   - Single Redis instance (scales to 100k users)
+   - PostgreSQL indexes (not sharding)
+
+---
+
+**Document Version:** 2.0  
 **Last Updated:** January 2026  
-**Maintainer:** Backend Team
+**Maintainer:** Backend Team  
+**Coverage:** Real-Time Chat + Presence Platform
 
