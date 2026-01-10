@@ -1,3 +1,5 @@
+the single biggest inspiration is: https://systemdesign.one/real-time-presence-platform-system-design/
+
 # Real-Time Presence Platform Architecture
 
 ## Executive Summary
